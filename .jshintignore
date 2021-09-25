@@ -1,7 +1,8 @@
 mkdocs/themes/**/js/highlight.pack.js
 mkdocs/themes/**/js/jquery-**.min.js
-mkdocs/themes/**/js/bootstrap-**.min.js
+mkdocs/themes/**/js/bootstrap.min.js
 mkdocs/themes/**/js/modernizr-**.min.js
-mkdocs/assets/search/mkdocs/js/require.js
-mkdocs/assets/search/mkdocs/js/mustache.min.js
-mkdocs/assets/search/mkdocs/js/lunr.min.js
+mkdocs/themes/readthedocs/js/theme.js
+mkdocs/contrib/search/templates/search/lunr.js
+mkdocs/contrib/search/lunr-language/lunr.**.js
+mkdocs/contrib/search/lunr-language/tinyseg.js

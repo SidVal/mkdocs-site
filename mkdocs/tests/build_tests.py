@@ -1,441 +1,536 @@
 #!/usr/bin/env python
-# coding: utf-8
 
-from __future__ import unicode_literals
-import os
-import shutil
-import tempfile
+from unittest import mock
 import unittest
-import mock
 
-try:
-    from itertools import izip as zip
-except ImportError:
-    # In Py3 use builtin zip function
-    pass
-
-
-from mkdocs import nav, config
+from mkdocs.exceptions import PluginError
+from mkdocs.structure.pages import Page
+from mkdocs.structure.files import File, Files
+from mkdocs.structure.nav import get_navigation
 from mkdocs.commands import build
-from mkdocs.exceptions import MarkdownNotFound
-from mkdocs.tests.base import dedent
+from mkdocs.tests.base import load_config, tempdir, PathAssertionMixin
+from mkdocs.utils import meta
 
 
-def load_config(cfg=None):
-    """ Helper to build a simple config for testing. """
-    cfg = cfg or {}
-    if 'site_name' not in cfg:
-        cfg['site_name'] = 'Example'
-    if 'config_file_path' not in cfg:
-        cfg['config_file_path'] = os.path.join(os.path.abspath('.'), 'mkdocs.yml')
-    if 'extra_css' not in cfg:
-        cfg['extra_css'] = ['css/extra.css']
-    conf = config.Config(schema=config.DEFAULT_SCHEMA)
-    conf.load_dict(cfg)
+def build_page(title, path, config, md_src=''):
+    """ Helper which returns a Page object. """
 
-    errors_warnings = conf.validate()
-    assert(errors_warnings == ([], [])), errors_warnings
-    return conf
+    files = Files([File(path, config['docs_dir'], config['site_dir'], config['use_directory_urls'])])
+    page = Page(title, list(files)[0], config)
+    # Fake page.read_source()
+    page.markdown, page.meta = meta.get_data(md_src)
+    return page, files
 
 
-class BuildTests(unittest.TestCase):
+class BuildTests(PathAssertionMixin, unittest.TestCase):
 
-    def test_empty_document(self):
-        html, toc, meta = build.convert_markdown("", load_config())
+    def assert_mock_called_once(self, mock):
+        """assert that the mock was called only once.
 
-        self.assertEqual(html, '')
-        self.assertEqual(len(list(toc)), 0)
-        self.assertEqual(meta, {})
-
-    def test_convert_markdown(self):
+        The `mock.assert_called_once()` method was added in PY36.
+        TODO: Remove this when PY35 support is dropped.
         """
-        Ensure that basic Markdown -> HTML and TOC works.
-        """
-        html, toc, meta = build.convert_markdown(dedent("""
-            page_title: custom title
+        try:
+            mock.assert_called_once()
+        except AttributeError:
+            if not mock.call_count == 1:
+                mock_name = mock._mock_name or 'mock'
+                msg = f"Expected '{mock_name}' to have been called once. Called {self.call_count} times."
+                raise AssertionError(msg)
 
-            # Heading 1
+    def _get_env_with_null_translations(self, config):
+        env = config['theme'].get_env()
+        env.add_extension('jinja2.ext.i18n')
+        env.install_null_translations()
+        return env
 
-            This is some text.
+    # Test build.get_context
 
-            # Heading 2
-
-            And some more text.
-        """), load_config())
-
-        expected_html = dedent("""
-            <h1 id="heading-1">Heading 1</h1>
-            <p>This is some text.</p>
-            <h1 id="heading-2">Heading 2</h1>
-            <p>And some more text.</p>
-        """)
-
-        expected_toc = dedent("""
-            Heading 1 - #heading-1
-            Heading 2 - #heading-2
-        """)
-
-        expected_meta = {'page_title': ['custom title']}
-
-        self.assertEqual(html.strip(), expected_html)
-        self.assertEqual(str(toc).strip(), expected_toc)
-        self.assertEqual(meta, expected_meta)
-
-    def test_convert_internal_link(self):
-        md_text = 'An [internal link](internal.md) to another document.'
-        expected = '<p>An <a href="internal/">internal link</a> to another document.</p>'
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_convert_multiple_internal_links(self):
-        md_text = '[First link](first.md) [second link](second.md).'
-        expected = '<p><a href="first/">First link</a> <a href="second/">second link</a>.</p>'
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_convert_internal_link_differing_directory(self):
-        md_text = 'An [internal link](../internal.md) to another document.'
-        expected = '<p>An <a href="../internal/">internal link</a> to another document.</p>'
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_convert_internal_link_with_anchor(self):
-        md_text = 'An [internal link](internal.md#section1.1) to another document.'
-        expected = '<p>An <a href="internal/#section1.1">internal link</a> to another document.</p>'
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_convert_internal_media(self):
-        """Test relative image URL's are the same for different base_urls"""
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
+    def test_context_base_url_homepage(self):
+        nav_cfg = [
+            {'Home': 'index.md'}
         ]
-
-        site_navigation = nav.SiteNavigation(pages)
-
-        expected_results = (
-            './img/initial-layout.png',
-            '../img/initial-layout.png',
-            '../img/initial-layout.png',
-        )
-
-        template = '<p><img alt="The initial MkDocs layout" src="%s" /></p>'
-
-        for (page, expected) in zip(site_navigation.walk_pages(), expected_results):
-            md_text = '![The initial MkDocs layout](img/initial-layout.png)'
-            html, _, _ = build.convert_markdown(md_text, load_config(), site_navigation=site_navigation)
-            self.assertEqual(html, template % expected)
-
-    def test_convert_internal_asbolute_media(self):
-        """Test absolute image URL's are correct for different base_urls"""
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
-        ]
-
-        site_navigation = nav.SiteNavigation(pages)
-
-        expected_results = (
-            './img/initial-layout.png',
-            '../img/initial-layout.png',
-            '../../img/initial-layout.png',
-        )
-
-        template = '<p><img alt="The initial MkDocs layout" src="%s" /></p>'
-
-        for (page, expected) in zip(site_navigation.walk_pages(), expected_results):
-            md_text = '![The initial MkDocs layout](/img/initial-layout.png)'
-            html, _, _ = build.convert_markdown(md_text, load_config(), site_navigation=site_navigation)
-            self.assertEqual(html, template % expected)
-
-    def test_dont_convert_code_block_urls(self):
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
-        ]
-
-        site_navigation = nav.SiteNavigation(pages)
-
-        expected = dedent("""
-        <p>An HTML Anchor::</p>
-        <pre><code>&lt;a href="index.md"&gt;My example link&lt;/a&gt;
-        </code></pre>
-        """)
-
-        for page in site_navigation.walk_pages():
-            markdown = 'An HTML Anchor::\n\n    <a href="index.md">My example link</a>\n'
-            html, _, _ = build.convert_markdown(markdown, load_config(), site_navigation=site_navigation)
-            self.assertEqual(dedent(html), expected)
-
-    def test_anchor_only_link(self):
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
-        ]
-
-        site_navigation = nav.SiteNavigation(pages)
-
-        for page in site_navigation.walk_pages():
-            markdown = '[test](#test)'
-            html, _, _ = build.convert_markdown(markdown, load_config(), site_navigation=site_navigation)
-            self.assertEqual(html, '<p><a href="#test">test</a></p>')
-
-    def test_ignore_external_link(self):
-        md_text = 'An [external link](http://example.com/external.md).'
-        expected = '<p>An <a href="http://example.com/external.md">external link</a>.</p>'
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_not_use_directory_urls(self):
-        md_text = 'An [internal link](internal.md) to another document.'
-        expected = '<p>An <a href="internal/index.html">internal link</a> to another document.</p>'
-        pages = [
-            'internal.md',
-        ]
-        site_navigation = nav.SiteNavigation(pages, use_directory_urls=False)
-        html, toc, meta = build.convert_markdown(md_text, load_config(), site_navigation=site_navigation)
-        self.assertEqual(html.strip(), expected.strip())
-
-    def test_ignore_email_links(self):
-        md_text = 'A <autolink@example.com> and an [link](mailto:example@example.com).'
-        expected = ''.join([
-            '<p>A <a href="&#109;&#97;&#105;&#108;&#116;&#111;&#58;&#97;&#117;&#116;',
-            '&#111;&#108;&#105;&#110;&#107;&#64;&#101;&#120;&#97;&#109;&#112;&#108;',
-            '&#101;&#46;&#99;&#111;&#109;">&#97;&#117;&#116;&#111;&#108;&#105;&#110;',
-            '&#107;&#64;&#101;&#120;&#97;&#109;&#112;&#108;&#101;&#46;&#99;&#111;&#109;',
-            '</a> and an <a href="mailto:example@example.com">link</a>.</p>'
+        cfg = load_config(nav=nav_cfg, use_directory_urls=False)
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
         ])
-        html, toc, meta = build.convert_markdown(md_text, load_config())
-        self.assertEqual(html.strip(), expected.strip())
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[0])
+        self.assertEqual(context['base_url'], '.')
 
-    def test_markdown_table_extension(self):
-        """
-        Ensure that the table extension is supported.
-        """
-        html, toc, meta = build.convert_markdown(dedent("""
-        First Header   | Second Header
-        -------------- | --------------
-        Content Cell 1 | Content Cell 2
-        Content Cell 3 | Content Cell 4
-        """), load_config())
-
-        expected_html = dedent("""
-        <table>
-        <thead>
-        <tr>
-        <th>First Header</th>
-        <th>Second Header</th>
-        </tr>
-        </thead>
-        <tbody>
-        <tr>
-        <td>Content Cell 1</td>
-        <td>Content Cell 2</td>
-        </tr>
-        <tr>
-        <td>Content Cell 3</td>
-        <td>Content Cell 4</td>
-        </tr>
-        </tbody>
-        </table>
-        """)
-
-        self.assertEqual(html.strip(), expected_html)
-
-    def test_markdown_fenced_code_extension(self):
-        """
-        Ensure that the fenced code extension is supported.
-        """
-        html, toc, meta = build.convert_markdown(dedent("""
-        ```
-        print 'foo'
-        ```
-        """), load_config())
-
-        expected_html = dedent("""
-        <pre><code>print 'foo'\n</code></pre>
-        """)
-
-        self.assertEqual(html.strip(), expected_html)
-
-    def test_markdown_custom_extension(self):
-        """
-        Check that an extension applies when requested in the arguments to
-        `convert_markdown`.
-        """
-        md_input = "foo__bar__baz"
-
-        # Check that the plugin is not active when not requested.
-        expected_without_smartstrong = "<p>foo<strong>bar</strong>baz</p>"
-        html_base, _, _ = build.convert_markdown(md_input, load_config())
-        self.assertEqual(html_base.strip(), expected_without_smartstrong)
-
-        # Check that the plugin is active when requested.
-        cfg = load_config({
-            'markdown_extensions': ['smart_strong']
-        })
-        expected_with_smartstrong = "<p>foo__bar__baz</p>"
-        html_ext, _, _ = build.convert_markdown(md_input, cfg)
-        self.assertEqual(html_ext.strip(), expected_with_smartstrong)
-
-    def test_markdown_duplicate_custom_extension(self):
-        """
-        Duplicated extension names should not cause problems.
-        """
-        cfg = load_config({
-            'markdown_extensions': ['toc']
-        })
-        md_input = "foo"
-        html_ext, _, _ = build.convert_markdown(md_input, cfg)
-        self.assertEqual(html_ext.strip(), '<p>foo</p>')
-
-    def test_copying_media(self):
-        docs_dir = tempfile.mkdtemp()
-        site_dir = tempfile.mkdtemp()
-        try:
-            # Create a non-empty markdown file, image, html file, dot file and dot directory.
-            f = open(os.path.join(docs_dir, 'index.md'), 'w')
-            f.write(dedent("""
-                page_title: custom title
-
-                # Heading 1
-
-                This is some text.
-
-                # Heading 2
-
-                And some more text.
-            """))
-            f.close()
-            open(os.path.join(docs_dir, 'img.jpg'), 'w').close()
-            open(os.path.join(docs_dir, 'example.html'), 'w').close()
-            open(os.path.join(docs_dir, '.hidden'), 'w').close()
-            os.mkdir(os.path.join(docs_dir, '.git'))
-            open(os.path.join(docs_dir, '.git/hidden'), 'w').close()
-
-            cfg = load_config({
-                'docs_dir': docs_dir,
-                'site_dir': site_dir
-            })
-            build.build(cfg)
-
-            # Verify only the markdown (coverted to html) and the image are copied.
-            self.assertTrue(os.path.isfile(os.path.join(site_dir, 'index.html')))
-            self.assertTrue(os.path.isfile(os.path.join(site_dir, 'img.jpg')))
-            self.assertTrue(os.path.isfile(os.path.join(site_dir, 'example.html')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, '.hidden')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, '.git/hidden')))
-        finally:
-            shutil.rmtree(docs_dir)
-            shutil.rmtree(site_dir)
-
-    def test_copy_theme_files(self):
-        docs_dir = tempfile.mkdtemp()
-        site_dir = tempfile.mkdtemp()
-        try:
-            # Create a non-empty markdown file.
-            f = open(os.path.join(docs_dir, 'index.md'), 'w')
-            f.write(dedent("""
-                page_title: custom title
-
-                # Heading 1
-
-                This is some text.
-            """))
-            f.close()
-
-            cfg = load_config({
-                'docs_dir': docs_dir,
-                'site_dir': site_dir
-            })
-            build.build(cfg)
-
-            # Verify only theme media are copied, not templates or Python files.
-            self.assertTrue(os.path.isfile(os.path.join(site_dir, 'index.html')))
-            self.assertTrue(os.path.isdir(os.path.join(site_dir, 'js')))
-            self.assertTrue(os.path.isdir(os.path.join(site_dir, 'css')))
-            self.assertTrue(os.path.isdir(os.path.join(site_dir, 'img')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, '__init__.py')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, '__init__.pyc')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, 'base.html')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, 'content.html')))
-            self.assertFalse(os.path.isfile(os.path.join(site_dir, 'nav.html')))
-        finally:
-            shutil.rmtree(docs_dir)
-            shutil.rmtree(site_dir)
-
-    def test_strict_mode_valid(self):
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
+    def test_context_base_url_homepage_use_directory_urls(self):
+        nav_cfg = [
+            {'Home': 'index.md'}
         ]
-        site_nav = nav.SiteNavigation(pages)
+        cfg = load_config(nav=nav_cfg)
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[0])
+        self.assertEqual(context['base_url'], '.')
 
-        valid = "[test](internal.md)"
-        build.convert_markdown(valid, load_config({'strict': False}), site_nav)
-        build.convert_markdown(valid, load_config({'strict': True}), site_nav)
-
-    def test_strict_mode_invalid(self):
-        pages = [
-            'index.md',
-            'internal.md',
-            'sub/internal.md',
+    def test_context_base_url_nested_page(self):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Nested': 'foo/bar.md'}
         ]
-        site_nav = nav.SiteNavigation(pages)
+        cfg = load_config(nav=nav_cfg, use_directory_urls=False)
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+            File('foo/bar.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[1])
+        self.assertEqual(context['base_url'], '..')
 
-        invalid = "[test](bad_link.md)"
-        build.convert_markdown(invalid, load_config({'strict': False}), site_nav)
-
-        self.assertRaises(
-            MarkdownNotFound,
-            build.convert_markdown, invalid, load_config({'strict': True}), site_nav)
-
-    def test_absolute_link(self):
-        pages = [
-            'index.md',
-            'sub/index.md',
+    def test_context_base_url_nested_page_use_directory_urls(self):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Nested': 'foo/bar.md'}
         ]
-        site_nav = nav.SiteNavigation(pages)
+        cfg = load_config(nav=nav_cfg)
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+            File('foo/bar.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[1])
+        self.assertEqual(context['base_url'], '../..')
 
-        markdown = "[test 1](/index.md) [test 2](/sub/index.md)"
-        cfg = load_config({'strict': True})
-        build.convert_markdown(markdown, cfg, site_nav)
+    def test_context_base_url_relative_no_page(self):
+        cfg = load_config(use_directory_urls=False)
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='..')
+        self.assertEqual(context['base_url'], '..')
 
-    def test_extension_config(self):
-        """
-        Test that a dictionary of 'markdown_extensions' is recognized as
-        both a list of extensions and a dictionary of extnesion configs.
-        """
-        cfg = load_config({
-            'markdown_extensions': [{'toc': {'permalink': True}}]
-        })
+    def test_context_base_url_relative_no_page_use_directory_urls(self):
+        cfg = load_config()
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='..')
+        self.assertEqual(context['base_url'], '..')
 
-        html, toc, meta = build.convert_markdown(dedent("""
-        # A Header
-        """), cfg)
+    def test_context_base_url_absolute_no_page(self):
+        cfg = load_config(use_directory_urls=False)
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='/')
+        self.assertEqual(context['base_url'], '/')
 
-        expected_html = dedent("""
-        <h1 id="a-header">A Header<a class="headerlink" href="#a-header" title="Permanent link">&para;</a></h1>
-        """)
+    def test_context_base_url__absolute_no_page_use_directory_urls(self):
+        cfg = load_config()
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='/')
+        self.assertEqual(context['base_url'], '/')
 
-        self.assertEqual(html.strip(), expected_html)
+    def test_context_base_url_absolute_nested_no_page(self):
+        cfg = load_config(use_directory_urls=False)
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='/foo/')
+        self.assertEqual(context['base_url'], '/foo/')
+
+    def test_context_base_url__absolute_nested_no_page_use_directory_urls(self):
+        cfg = load_config()
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='/foo/')
+        self.assertEqual(context['base_url'], '/foo/')
+
+    def test_context_extra_css_js_from_homepage(self):
+        nav_cfg = [
+            {'Home': 'index.md'}
+        ]
+        cfg = load_config(
+            nav=nav_cfg,
+            extra_css=['style.css'],
+            extra_javascript=['script.js'],
+            use_directory_urls=False
+        )
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[0])
+        self.assertEqual(context['extra_css'], ['style.css'])
+        self.assertEqual(context['extra_javascript'], ['script.js'])
+
+    def test_context_extra_css_js_from_nested_page(self):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Nested': 'foo/bar.md'}
+        ]
+        cfg = load_config(
+            nav=nav_cfg,
+            extra_css=['style.css'],
+            extra_javascript=['script.js'],
+            use_directory_urls=False
+        )
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+            File('foo/bar.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[1])
+        self.assertEqual(context['extra_css'], ['../style.css'])
+        self.assertEqual(context['extra_javascript'], ['../script.js'])
+
+    def test_context_extra_css_js_from_nested_page_use_directory_urls(self):
+        nav_cfg = [
+            {'Home': 'index.md'},
+            {'Nested': 'foo/bar.md'}
+        ]
+        cfg = load_config(
+            nav=nav_cfg,
+            extra_css=['style.css'],
+            extra_javascript=['script.js']
+        )
+        files = Files([
+            File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+            File('foo/bar.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        ])
+        nav = get_navigation(files, cfg)
+        context = build.get_context(nav, files, cfg, nav.pages[1])
+        self.assertEqual(context['extra_css'], ['../../style.css'])
+        self.assertEqual(context['extra_javascript'], ['../../script.js'])
+
+    def test_context_extra_css_js_no_page(self):
+        cfg = load_config(extra_css=['style.css'], extra_javascript=['script.js'])
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg, base_url='..')
+        self.assertEqual(context['extra_css'], ['../style.css'])
+        self.assertEqual(context['extra_javascript'], ['../script.js'])
 
     def test_extra_context(self):
-
-        # Same as the default schema, but don't verify the docs_dir exists.
-        cfg = load_config({
-            'site_name': "Site",
-            'extra': {
-                'a': 1
-            }
-        })
-
-        context = build.get_global_context(mock.Mock(), cfg)
-
+        cfg = load_config(extra={'a': 1})
+        context = build.get_context(mock.Mock(), mock.Mock(), cfg)
         self.assertEqual(context['config']['extra']['a'], 1)
+
+    # Test build._build_theme_template
+
+    @mock.patch('mkdocs.utils.write_file')
+    @mock.patch('mkdocs.commands.build._build_template', return_value='some content')
+    def test_build_theme_template(self, mock_build_template, mock_write_file):
+        cfg = load_config()
+        env = cfg['theme'].get_env()
+        build._build_theme_template('main.html', env, mock.Mock(), cfg, mock.Mock())
+        self.assert_mock_called_once(mock_write_file)
+        self.assert_mock_called_once(mock_build_template)
+
+    @mock.patch('mkdocs.utils.write_file')
+    @mock.patch('mkdocs.commands.build._build_template', return_value='some content')
+    @mock.patch('gzip.GzipFile')
+    def test_build_sitemap_template(self, mock_gzip_gzipfile, mock_build_template, mock_write_file):
+        cfg = load_config()
+        env = cfg['theme'].get_env()
+        build._build_theme_template('sitemap.xml', env, mock.Mock(), cfg, mock.Mock())
+        self.assert_mock_called_once(mock_write_file)
+        self.assert_mock_called_once(mock_build_template)
+        self.assert_mock_called_once(mock_gzip_gzipfile)
+
+    @mock.patch('mkdocs.utils.write_file')
+    @mock.patch('mkdocs.commands.build._build_template', return_value='')
+    def test_skip_missing_theme_template(self, mock_build_template, mock_write_file):
+        cfg = load_config()
+        env = cfg['theme'].get_env()
+        with self.assertLogs('mkdocs', level='WARN') as cm:
+            build._build_theme_template('missing.html', env, mock.Mock(), cfg, mock.Mock())
+        self.assertEqual(
+            cm.output,
+            ["WARNING:mkdocs.commands.build:Template skipped: 'missing.html' not found in theme directories."]
+        )
+        mock_write_file.assert_not_called()
+        mock_build_template.assert_not_called()
+
+    @mock.patch('mkdocs.utils.write_file')
+    @mock.patch('mkdocs.commands.build._build_template', return_value='')
+    def test_skip_theme_template_empty_output(self, mock_build_template, mock_write_file):
+        cfg = load_config()
+        env = cfg['theme'].get_env()
+        with self.assertLogs('mkdocs', level='INFO') as cm:
+            build._build_theme_template('main.html', env, mock.Mock(), cfg, mock.Mock())
+        self.assertEqual(
+            cm.output,
+            ["INFO:mkdocs.commands.build:Template skipped: 'main.html' generated empty output."]
+        )
+        mock_write_file.assert_not_called()
+        self.assert_mock_called_once(mock_build_template)
+
+    # Test build._build_extra_template
+
+    @mock.patch('mkdocs.commands.build.open', mock.mock_open(read_data='template content'))
+    def test_build_extra_template(self):
+        cfg = load_config()
+        files = Files([
+            File('foo.html', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        build._build_extra_template('foo.html', files, cfg, mock.Mock())
+
+    @mock.patch('mkdocs.commands.build.open', mock.mock_open(read_data='template content'))
+    def test_skip_missing_extra_template(self):
+        cfg = load_config()
+        files = Files([
+            File('foo.html', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        with self.assertLogs('mkdocs', level='INFO') as cm:
+            build._build_extra_template('missing.html', files, cfg, mock.Mock())
+        self.assertEqual(
+            cm.output,
+            ["WARNING:mkdocs.commands.build:Template skipped: 'missing.html' not found in docs_dir."]
+        )
+
+    @mock.patch('mkdocs.commands.build.open', side_effect=OSError('Error message.'))
+    def test_skip_ioerror_extra_template(self, mock_open):
+        cfg = load_config()
+        files = Files([
+            File('foo.html', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        with self.assertLogs('mkdocs', level='INFO') as cm:
+            build._build_extra_template('foo.html', files, cfg, mock.Mock())
+        self.assertEqual(
+            cm.output,
+            ["WARNING:mkdocs.commands.build:Error reading template 'foo.html': Error message."]
+        )
+
+    @mock.patch('mkdocs.commands.build.open', mock.mock_open(read_data=''))
+    def test_skip_extra_template_empty_output(self):
+        cfg = load_config()
+        files = Files([
+            File('foo.html', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls']),
+        ])
+        with self.assertLogs('mkdocs', level='INFO') as cm:
+            build._build_extra_template('foo.html', files, cfg, mock.Mock())
+        self.assertEqual(
+            cm.output,
+            ["INFO:mkdocs.commands.build:Template skipped: 'foo.html' generated empty output."]
+        )
+
+    # Test build._populate_page
+
+    @tempdir(files={'index.md': 'page content'})
+    def test_populate_page(self, docs_dir):
+        cfg = load_config(docs_dir=docs_dir)
+        file = File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        page = Page('Foo', file, cfg)
+        build._populate_page(page, cfg, Files([file]))
+        self.assertEqual(page.content, '<p>page content</p>')
+
+    @tempdir(files={'testing.html': '<p>page content</p>'})
+    def test_populate_page_dirty_modified(self, site_dir):
+        cfg = load_config(site_dir=site_dir)
+        file = File('testing.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        page = Page('Foo', file, cfg)
+        build._populate_page(page, cfg, Files([file]), dirty=True)
+        self.assertTrue(page.markdown.startswith('# Welcome to MkDocs'))
+        self.assertTrue(page.content.startswith('<h1 id="welcome-to-mkdocs">Welcome to MkDocs</h1>'))
+
+    @tempdir(files={'index.md': 'page content'})
+    @tempdir(files={'index.html': '<p>page content</p>'})
+    def test_populate_page_dirty_not_modified(self, site_dir, docs_dir):
+        cfg = load_config(docs_dir=docs_dir, site_dir=site_dir)
+        file = File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        page = Page('Foo', file, cfg)
+        build._populate_page(page, cfg, Files([file]), dirty=True)
+        # Content is empty as file read was skipped
+        self.assertEqual(page.markdown, None)
+        self.assertEqual(page.content, None)
+
+    @tempdir(files={'index.md': 'new page content'})
+    @mock.patch('mkdocs.structure.pages.open', side_effect=OSError('Error message.'))
+    def test_populate_page_read_error(self, docs_dir, mock_open):
+        cfg = load_config(docs_dir=docs_dir)
+        file = File('missing.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        page = Page('Foo', file, cfg)
+        with self.assertLogs('mkdocs', level='ERROR') as cm:
+            self.assertRaises(OSError, build._populate_page, page, cfg, Files([file]))
+        self.assertEqual(
+            cm.output, [
+                'ERROR:mkdocs.structure.pages:File not found: missing.md',
+                "ERROR:mkdocs.commands.build:Error reading page 'missing.md': Error message."
+            ]
+        )
+        self.assert_mock_called_once(mock_open)
+
+    @tempdir(files={'index.md': 'page content'})
+    @mock.patch('mkdocs.plugins.PluginCollection.run_event', side_effect=PluginError('Error message.'))
+    def test_populate_page_read_plugin_error(self, docs_dir, mock_open):
+        cfg = load_config(docs_dir=docs_dir)
+        file = File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])
+        page = Page('Foo', file, cfg)
+        with self.assertLogs('mkdocs', level='ERROR') as cm:
+            self.assertRaises(PluginError, build._populate_page, page, cfg, Files([file]))
+        self.assertEqual(
+            cm.output, [
+                "ERROR:mkdocs.commands.build:Error reading page 'index.md':"
+            ]
+        )
+        self.assert_mock_called_once(mock_open)
+
+    # Test build._build_page
+
+    @tempdir()
+    def test_build_page(self, site_dir):
+        cfg = load_config(site_dir=site_dir, nav=['index.md'], plugins=[])
+        files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.markdown = 'page content'
+        page.content = '<p>page content</p>'
+        build._build_page(page, cfg, files, nav, self._get_env_with_null_translations(cfg))
+        self.assertPathIsFile(site_dir, 'index.html')
+
+    # TODO: fix this. It seems that jinja2 chokes on the mock object. Not sure how to resolve.
+    # @tempdir()
+    # @mock.patch('jinja2.environment.Template')
+    # def test_build_page_empty(self, site_dir, mock_template):
+    #     mock_template.render = mock.Mock(return_value='')
+    #     cfg = load_config(site_dir=site_dir, nav=['index.md'], plugins=[])
+    #     files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+    #     nav = get_navigation(files, cfg)
+    #     page = files.documentation_pages()[0].page
+    #     # Fake populate page
+    #     page.title = ''
+    #     page.markdown = ''
+    #     page.content = ''
+    #     with self.assertLogs('mkdocs', level='INFO') as cm:
+    #         build._build_page(page, cfg, files, nav, cfg['theme'].get_env())
+    #     self.assertEqual(
+    #         cm.output,
+    #         ["INFO:mkdocs.commands.build:Page skipped: 'index.md'. Generated empty output."]
+    #     )
+    #     self.assert_mock_called_once(mock_template.render)
+    #     self.assertPathNotFile(site_dir, 'index.html')
+
+    @tempdir(files={'index.md': 'page content'})
+    @tempdir(files={'index.html': '<p>page content</p>'})
+    @mock.patch('mkdocs.utils.write_file')
+    def test_build_page_dirty_modified(self, site_dir, docs_dir, mock_write_file):
+        cfg = load_config(docs_dir=docs_dir, site_dir=site_dir, nav=['index.md'], plugins=[])
+        files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.markdown = 'new page content'
+        page.content = '<p>new page content</p>'
+        build._build_page(page, cfg, files, nav, self._get_env_with_null_translations(cfg), dirty=True)
+        mock_write_file.assert_not_called()
+
+    @tempdir(files={'testing.html': '<p>page content</p>'})
+    @mock.patch('mkdocs.utils.write_file')
+    def test_build_page_dirty_not_modified(self, site_dir, mock_write_file):
+        cfg = load_config(site_dir=site_dir, nav=['testing.md'], plugins=[])
+        files = Files([File('testing.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.markdown = 'page content'
+        page.content = '<p>page content</p>'
+        build._build_page(page, cfg, files, nav, self._get_env_with_null_translations(cfg), dirty=True)
+        self.assert_mock_called_once(mock_write_file)
+
+    @tempdir()
+    def test_build_page_custom_template(self, site_dir):
+        cfg = load_config(site_dir=site_dir, nav=['index.md'], plugins=[])
+        files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.meta = {'template': '404.html'}
+        page.markdown = 'page content'
+        page.content = '<p>page content</p>'
+        build._build_page(page, cfg, files, nav, self._get_env_with_null_translations(cfg))
+        self.assertPathIsFile(site_dir, 'index.html')
+
+    @tempdir()
+    @mock.patch('mkdocs.utils.write_file', side_effect=OSError('Error message.'))
+    def test_build_page_error(self, site_dir, mock_write_file):
+        cfg = load_config(site_dir=site_dir, nav=['index.md'], plugins=[])
+        files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.markdown = 'page content'
+        page.content = '<p>page content</p>'
+        with self.assertLogs('mkdocs', level='ERROR') as cm:
+            self.assertRaises(
+                    OSError,
+                    build._build_page,
+                    page,
+                    cfg,
+                    files,
+                    nav,
+                    self._get_env_with_null_translations(cfg)
+            )
+        self.assertEqual(
+            cm.output,
+            ["ERROR:mkdocs.commands.build:Error building page 'index.md': Error message."]
+        )
+        self.assert_mock_called_once(mock_write_file)
+
+    @tempdir()
+    @mock.patch('mkdocs.plugins.PluginCollection.run_event', side_effect=PluginError('Error message.'))
+    def test_build_page_plugin_error(self, site_dir, mock_write_file):
+        cfg = load_config(site_dir=site_dir, nav=['index.md'], plugins=[])
+        files = Files([File('index.md', cfg['docs_dir'], cfg['site_dir'], cfg['use_directory_urls'])])
+        nav = get_navigation(files, cfg)
+        page = files.documentation_pages()[0].page
+        # Fake populate page
+        page.title = 'Title'
+        page.markdown = 'page content'
+        page.content = '<p>page content</p>'
+        with self.assertLogs('mkdocs', level='ERROR') as cm:
+            self.assertRaises(PluginError, build._build_page, page, cfg, files, nav, cfg['theme'].get_env())
+        self.assertEqual(
+            cm.output,
+            ["ERROR:mkdocs.commands.build:Error building page 'index.md':"]
+        )
+        self.assert_mock_called_once(mock_write_file)
+
+    # Test build.build
+
+    @tempdir(files={
+        'index.md': 'page content',
+        'empty.md': '',
+        'img.jpg': '',
+        'static.html': 'content',
+        '.hidden': 'content',
+        '.git/hidden': 'content'
+    })
+    @tempdir()
+    def test_copying_media(self, site_dir, docs_dir):
+        cfg = load_config(docs_dir=docs_dir, site_dir=site_dir)
+        build.build(cfg)
+
+        # Verify that only non-empty md file (converted to html), static HTML file and image are copied.
+        self.assertPathIsFile(site_dir, 'index.html')
+        self.assertPathIsFile(site_dir, 'img.jpg')
+        self.assertPathIsFile(site_dir, 'static.html')
+        self.assertPathNotExists(site_dir, 'empty.md')
+        self.assertPathNotExists(site_dir, '.hidden')
+        self.assertPathNotExists(site_dir, '.git/hidden')
+
+    @tempdir(files={'index.md': 'page content'})
+    @tempdir()
+    def test_copy_theme_files(self, site_dir, docs_dir):
+        cfg = load_config(docs_dir=docs_dir, site_dir=site_dir)
+        build.build(cfg)
+
+        # Verify only theme media are copied, not templates, Python or localization files.
+        self.assertPathIsFile(site_dir, 'index.html')
+        self.assertPathIsFile(site_dir, '404.html')
+        self.assertPathIsDir(site_dir, 'js')
+        self.assertPathIsDir(site_dir, 'css')
+        self.assertPathIsDir(site_dir, 'img')
+        self.assertPathIsDir(site_dir, 'fonts')
+        self.assertPathNotExists(site_dir, '__init__.py')
+        self.assertPathNotExists(site_dir, '__init__.pyc')
+        self.assertPathNotExists(site_dir, 'base.html')
+        self.assertPathNotExists(site_dir, 'content.html')
+        self.assertPathNotExists(site_dir, 'main.html')
+        self.assertPathNotExists(site_dir, 'locales')
+
+    # Test build.site_directory_contains_stale_files
+
+    @tempdir(files=['index.html'])
+    def test_site_dir_contains_stale_files(self, site_dir):
+        self.assertTrue(build.site_directory_contains_stale_files(site_dir))
+
+    @tempdir()
+    def test_not_site_dir_contains_stale_files(self, site_dir):
+        self.assertFalse(build.site_directory_contains_stale_files(site_dir))

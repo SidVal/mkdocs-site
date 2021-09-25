@@ -1,85 +1,19 @@
-from __future__ import unicode_literals
-
 import logging
 import shutil
 import tempfile
+from urllib.parse import urlsplit
+from os.path import isdir, isfile, join
 
-from os.path import isfile, join
 from mkdocs.commands.build import build
 from mkdocs.config import load_config
+from mkdocs.exceptions import Abort
+from mkdocs.livereload import LiveReloadServer
 
 log = logging.getLogger(__name__)
 
 
-def _get_handler(site_dir, StaticFileHandler):
-
-    from tornado.template import Loader
-
-    class WebHandler(StaticFileHandler):
-
-        def write_error(self, status_code, **kwargs):
-
-            if status_code in (404, 500):
-                error_page = '{}.html'.format(status_code)
-                if isfile(join(site_dir, error_page)):
-                    self.write(Loader(site_dir).load(error_page).generate())
-                else:
-                    super(WebHandler, self).write_error(status_code, **kwargs)
-
-    return WebHandler
-
-
-def _livereload(host, port, config, builder, site_dir):
-
-    # We are importing here for anyone that has issues with livereload. Even if
-    # this fails, the --no-livereload alternative should still work.
-    from livereload import Server
-    import livereload.handlers
-
-    class LiveReloadServer(Server):
-
-        def get_web_handlers(self, script):
-            handlers = super(LiveReloadServer, self).get_web_handlers(script)
-            # replace livereload handler
-            return [(handlers[0][0], _get_handler(site_dir, livereload.handlers.StaticFileHandler), handlers[0][2],)]
-
-    server = LiveReloadServer()
-
-    # Watch the documentation files, the config file and the theme files.
-    server.watch(config['docs_dir'], builder)
-    server.watch(config['config_file_path'], builder)
-
-    for d in config['theme_dir']:
-        server.watch(d, builder)
-
-    server.serve(root=site_dir, host=host, port=port, restart_delay=0)
-
-
-def _static_server(host, port, site_dir):
-
-    # Importing here to seperate the code paths from the --livereload
-    # alternative.
-    from tornado import ioloop
-    from tornado import web
-
-    application = web.Application([
-        (r"/(.*)", _get_handler(site_dir, web.StaticFileHandler), {
-            "path": site_dir,
-            "default_filename": "index.html"
-        }),
-    ])
-    application.listen(port=port, address=host)
-
-    log.info('Running at: http://%s:%s/', host, port)
-    log.info('Hold ctrl+c to quit.')
-    try:
-        ioloop.IOLoop.instance().start()
-    except KeyboardInterrupt:
-        log.info('Stopping server...')
-
-
 def serve(config_file=None, dev_addr=None, strict=None, theme=None,
-          theme_dir=None, livereload='livereload'):
+          theme_dir=None, livereload='livereload', watch_theme=False, **kwargs):
     """
     Start the MkDocs development server
 
@@ -89,7 +23,12 @@ def serve(config_file=None, dev_addr=None, strict=None, theme=None,
     """
 
     # Create a temporary build directory, and set some options to serve it
-    tempdir = tempfile.mkdtemp()
+    # PY2 returns a byte string by default. The Unicode prefix ensures a Unicode
+    # string is returned. And it makes MkDocs temp dirs easier to identify.
+    site_dir = tempfile.mkdtemp(prefix='mkdocs_')
+
+    def mount_path(config):
+        return urlsplit(config['site_url'] or '/').path
 
     def builder():
         log.info("Building documentation...")
@@ -98,9 +37,13 @@ def serve(config_file=None, dev_addr=None, strict=None, theme=None,
             dev_addr=dev_addr,
             strict=strict,
             theme=theme,
-            theme_dir=theme_dir
+            theme_dir=theme_dir,
+            site_dir=site_dir,
+            **kwargs
         )
-        config['site_dir'] = tempdir
+        # Override a few config settings after validation
+        config['site_url'] = 'http://{}{}'.format(config['dev_addr'], mount_path(config))
+
         live_server = livereload in ['dirty', 'livereload']
         dirty = livereload == 'dirty'
         build(config, live_server=live_server, dirty=dirty)
@@ -111,10 +54,38 @@ def serve(config_file=None, dev_addr=None, strict=None, theme=None,
         config = builder()
 
         host, port = config['dev_addr']
+        server = LiveReloadServer(builder=builder, host=host, port=port, root=site_dir, mount_path=mount_path(config))
+
+        def error_handler(code):
+            if code in (404, 500):
+                error_page = join(site_dir, f'{code}.html')
+                if isfile(error_page):
+                    with open(error_page, 'rb') as f:
+                        return f.read()
+
+        server.error_handler = error_handler
 
         if livereload in ['livereload', 'dirty']:
-            _livereload(host, port, config, builder, tempdir)
-        else:
-            _static_server(host, port, tempdir)
+            # Watch the documentation files, the config file and the theme files.
+            server.watch(config['docs_dir'])
+            server.watch(config['config_file_path'])
+
+            if watch_theme:
+                for d in config['theme'].dirs:
+                    server.watch(d)
+
+            # Run `serve` plugin events.
+            server = config['plugins'].run_event('serve', server, config=config, builder=builder)
+
+        try:
+            server.serve()
+        except KeyboardInterrupt:
+            log.info("Shutting down...")
+        finally:
+            server.shutdown()
+    except OSError as e:  # pragma: no cover
+        # Avoid ugly, unhelpful traceback
+        raise Abort(str(e))
     finally:
-        shutil.rmtree(tempdir)
+        if isdir(site_dir):
+            shutil.rmtree(site_dir)

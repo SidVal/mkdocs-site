@@ -1,12 +1,12 @@
-from __future__ import unicode_literals
-
 import os
-import tempfile
+import sys
 import unittest
+from unittest.mock import patch
 
 import mkdocs
-from mkdocs import utils
 from mkdocs.config import config_options
+from mkdocs.config.base import Config
+from mkdocs.tests.base import tempdir
 
 
 class OptionallyRequiredTest(unittest.TestCase):
@@ -50,7 +50,7 @@ class TypeTest(unittest.TestCase):
 
     def test_single_type(self):
 
-        option = config_options.Type(utils.string_types)
+        option = config_options.Type(str)
         value = option.validate("Testing")
         self.assertEqual(value, "Testing")
 
@@ -67,13 +67,96 @@ class TypeTest(unittest.TestCase):
                           option.validate, {'a': 1})
 
     def test_length(self):
-        option = config_options.Type(utils.string_types, length=7)
+        option = config_options.Type(str, length=7)
 
         value = option.validate("Testing")
         self.assertEqual(value, "Testing")
 
         self.assertRaises(config_options.ValidationError,
                           option.validate, "Testing Long")
+
+
+class ChoiceTest(unittest.TestCase):
+
+    def test_valid_choice(self):
+        option = config_options.Choice(('python', 'node'))
+        value = option.validate('python')
+        self.assertEqual(value, 'python')
+
+    def test_invalid_choice(self):
+        option = config_options.Choice(('python', 'node'))
+        self.assertRaises(
+            config_options.ValidationError, option.validate, 'go')
+
+    def test_invalid_choices(self):
+        self.assertRaises(ValueError, config_options.Choice, '')
+        self.assertRaises(ValueError, config_options.Choice, [])
+        self.assertRaises(ValueError, config_options.Choice, 5)
+
+
+class DeprecatedTest(unittest.TestCase):
+
+    def test_deprecated_option_simple(self):
+        option = config_options.Deprecated()
+        option.pre_validation({'d': 'value'}, 'd')
+        self.assertEqual(len(option.warnings), 1)
+        option.validate('value')
+
+    def test_deprecated_option_message(self):
+        msg = 'custom message for {} key'
+        option = config_options.Deprecated(message=msg)
+        option.pre_validation({'d': 'value'}, 'd')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertEqual(option.warnings[0], msg.format('d'))
+
+    def test_deprecated_option_with_type(self):
+        option = config_options.Deprecated(option_type=config_options.Type(str))
+        option.pre_validation({'d': 'value'}, 'd')
+        self.assertEqual(len(option.warnings), 1)
+        option.validate('value')
+
+    def test_deprecated_option_with_invalid_type(self):
+        option = config_options.Deprecated(option_type=config_options.Type(list))
+        config = {'d': 'string'}
+        option.pre_validation({'d': 'value'}, 'd')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate,
+            config['d']
+        )
+
+    def test_deprecated_option_with_type_undefined(self):
+        option = config_options.Deprecated(option_type=config_options.Type(str))
+        option.validate(None)
+
+    def test_deprecated_option_move(self):
+        option = config_options.Deprecated(moved_to='new')
+        config = {'old': 'value'}
+        option.pre_validation(config, 'old')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertEqual(config, {'new': 'value'})
+
+    def test_deprecated_option_move_complex(self):
+        option = config_options.Deprecated(moved_to='foo.bar')
+        config = {'old': 'value'}
+        option.pre_validation(config, 'old')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertEqual(config, {'foo': {'bar': 'value'}})
+
+    def test_deprecated_option_move_existing(self):
+        option = config_options.Deprecated(moved_to='foo.bar')
+        config = {'old': 'value', 'foo': {'existing': 'existing'}}
+        option.pre_validation(config, 'old')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertEqual(config, {'foo': {'existing': 'existing', 'bar': 'value'}})
+
+    def test_deprecated_option_move_invalid(self):
+        option = config_options.Deprecated(moved_to='foo.bar')
+        config = {'old': 'value', 'foo': 'wrong type'}
+        option.pre_validation(config, 'old')
+        self.assertEqual(len(option.warnings), 1)
+        self.assertEqual(config, {'old': 'value', 'foo': 'wrong type'})
 
 
 class IpAddressTest(unittest.TestCase):
@@ -83,17 +166,17 @@ class IpAddressTest(unittest.TestCase):
 
         option = config_options.IpAddress()
         value = option.validate(addr)
-        self.assertEqual(utils.text_type(value), addr)
+        self.assertEqual(str(value), addr)
         self.assertEqual(value.host, '127.0.0.1')
         self.assertEqual(value.port, 8000)
 
     def test_valid_IPv6_address(self):
-        addr = '[::1]:8000'
+        addr = '::1:8000'
 
         option = config_options.IpAddress()
         value = option.validate(addr)
-        self.assertEqual(utils.text_type(value), addr)
-        self.assertEqual(value.host, '[::1]')
+        self.assertEqual(str(value), addr)
+        self.assertEqual(value.host, '::1')
         self.assertEqual(value.port, 8000)
 
     def test_named_address(self):
@@ -101,7 +184,7 @@ class IpAddressTest(unittest.TestCase):
 
         option = config_options.IpAddress()
         value = option.validate(addr)
-        self.assertEqual(utils.text_type(value), addr)
+        self.assertEqual(str(value), addr)
         self.assertEqual(value.host, 'localhost')
         self.assertEqual(value.port, 8000)
 
@@ -110,9 +193,40 @@ class IpAddressTest(unittest.TestCase):
 
         option = config_options.IpAddress(default=addr)
         value = option.validate(None)
-        self.assertEqual(utils.text_type(value), addr)
+        self.assertEqual(str(value), addr)
         self.assertEqual(value.host, '127.0.0.1')
         self.assertEqual(value.port, 8000)
+
+    @unittest.skipIf(
+        sys.version_info >= (3, 9, 5),
+        "Leading zeros not allowed in IP addresses since Python3.9.5",
+    )
+    def test_IP_normalization(self):
+        addr = '127.000.000.001:8000'
+        option = config_options.IpAddress(default=addr)
+        value = option.validate(None)
+        self.assertEqual(str(value), '127.0.0.1:8000')
+        self.assertEqual(value.host, '127.0.0.1')
+        self.assertEqual(value.port, 8000)
+
+    @unittest.skipIf(
+        sys.version_info < (3, 9, 5),
+        "Leading zeros allowed in IP addresses before Python3.9.5",
+    )
+    def test_invalid_leading_zeros(self):
+        addr = '127.000.000.001:8000'
+        option = config_options.IpAddress(default=addr)
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate, addr
+        )
+
+    def test_invalid_address_range(self):
+        option = config_options.IpAddress()
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate, '277.0.0.1:8000'
+        )
 
     def test_invalid_address_format(self):
         option = config_options.IpAddress()
@@ -142,25 +256,54 @@ class IpAddressTest(unittest.TestCase):
             option.validate, '127.0.0.1'
         )
 
+    def test_unsupported_address(self):
+        option = config_options.IpAddress()
+        value = option.validate('0.0.0.0:8000')
+        option.post_validation({'dev_addr': value}, 'dev_addr')
+        self.assertEqual(len(option.warnings), 1)
+
+    def test_unsupported_IPv6_address(self):
+        option = config_options.IpAddress()
+        value = option.validate(':::8000')
+        option.post_validation({'dev_addr': value}, 'dev_addr')
+        self.assertEqual(len(option.warnings), 1)
+
+    def test_invalid_IPv6_address(self):
+        # The server will error out with this so we treat it as invalid.
+        option = config_options.IpAddress()
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate, '[::1]:8000'
+        )
+
 
 class URLTest(unittest.TestCase):
 
     def test_valid_url(self):
-
-        url = "http://mkdocs.org"
-
         option = config_options.URL()
-        value = option.validate(url)
-        self.assertEqual(value, url)
+
+        self.assertEqual(option.validate("https://mkdocs.org"), "https://mkdocs.org")
+        self.assertEqual(option.validate(""), "")
+
+    def test_valid_url_is_dir(self):
+        option = config_options.URL(is_dir=True)
+
+        self.assertEqual(option.validate("http://mkdocs.org/"), "http://mkdocs.org/")
+        self.assertEqual(option.validate("https://mkdocs.org"), "https://mkdocs.org/")
 
     def test_invalid_url(self):
-
         option = config_options.URL()
+
         self.assertRaises(config_options.ValidationError,
                           option.validate, "www.mkdocs.org")
+        self.assertRaises(config_options.ValidationError,
+                          option.validate, "//mkdocs.org/test")
+        self.assertRaises(config_options.ValidationError,
+                          option.validate, "http:/mkdocs.org/")
+        self.assertRaises(config_options.ValidationError,
+                          option.validate, "/hello/")
 
-    def test_invalid(self):
-
+    def test_invalid_type(self):
         option = config_options.URL()
         self.assertRaises(config_options.ValidationError,
                           option.validate, 1)
@@ -173,7 +316,6 @@ class RepoURLTest(unittest.TestCase):
         option = config_options.RepoURL()
         config = {'repo_url': "https://github.com/mkdocs/mkdocs"}
         option.post_validation(config, 'repo_url')
-        self.assertEqual(config['repo_url'], config['repo_url'])
         self.assertEqual(config['repo_name'], "GitHub")
 
     def test_repo_name_bitbucket(self):
@@ -181,15 +323,20 @@ class RepoURLTest(unittest.TestCase):
         option = config_options.RepoURL()
         config = {'repo_url': "https://bitbucket.org/gutworth/six/"}
         option.post_validation(config, 'repo_url')
-        self.assertEqual(config['repo_url'], config['repo_url'])
         self.assertEqual(config['repo_name'], "Bitbucket")
+
+    def test_repo_name_gitlab(self):
+
+        option = config_options.RepoURL()
+        config = {'repo_url': "https://gitlab.com/gitlab-org/gitlab-ce/"}
+        option.post_validation(config, 'repo_url')
+        self.assertEqual(config['repo_name'], "GitLab")
 
     def test_repo_name_custom(self):
 
         option = config_options.RepoURL()
         config = {'repo_url': "https://launchpad.net/python-tuskarclient"}
         option.post_validation(config, 'repo_url')
-        self.assertEqual(config['repo_url'], config['repo_url'])
         self.assertEqual(config['repo_name'], "Launchpad")
 
     def test_edit_uri_github(self):
@@ -206,12 +353,27 @@ class RepoURLTest(unittest.TestCase):
         option.post_validation(config, 'repo_url')
         self.assertEqual(config['edit_uri'], 'src/default/docs/')
 
+    def test_edit_uri_gitlab(self):
+
+        option = config_options.RepoURL()
+        config = {'repo_url': "https://gitlab.com/gitlab-org/gitlab-ce/"}
+        option.post_validation(config, 'repo_url')
+        self.assertEqual(config['edit_uri'], 'edit/master/docs/')
+
     def test_edit_uri_custom(self):
 
         option = config_options.RepoURL()
         config = {'repo_url': "https://launchpad.net/python-tuskarclient"}
         option.post_validation(config, 'repo_url')
-        self.assertEqual(config.get('edit_uri'), None)
+        self.assertEqual(config.get('edit_uri'), '')
+
+    def test_repo_name_custom_and_empty_edit_uri(self):
+
+        option = config_options.RepoURL()
+        config = {'repo_url': "https://github.com/mkdocs/mkdocs",
+                  'repo_name': 'mkdocs'}
+        option.post_validation(config, 'repo_url')
+        self.assertEqual(config.get('edit_uri'), 'edit/master/docs/')
 
 
 class DirTest(unittest.TestCase):
@@ -253,19 +415,95 @@ class DirTest(unittest.TestCase):
         self.assertRaises(config_options.ValidationError,
                           option.validate, [])
 
-    def test_doc_dir_is_config_dir(self):
+    def test_dir_unicode(self):
+        cfg = Config(
+            [('dir', config_options.Dir())],
+            config_file_path=os.path.join(os.path.abspath('.'), 'mkdocs.yml'),
+        )
 
         test_config = {
-            'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml'),
-            'docs_dir': '.'
+            'dir': 'юникод'
         }
 
-        docs_dir = config_options.Dir()
+        cfg.load_dict(test_config)
 
-        test_config['docs_dir'] = docs_dir.validate(test_config['docs_dir'])
+        fails, warns = cfg.validate()
 
-        self.assertRaises(config_options.ValidationError,
-                          docs_dir.post_validation, test_config, 'docs_dir')
+        self.assertEqual(len(fails), 0)
+        self.assertEqual(len(warns), 0)
+        self.assertIsInstance(cfg['dir'], str)
+
+    def test_dir_filesystemencoding(self):
+        cfg = Config(
+            [('dir', config_options.Dir())],
+            config_file_path=os.path.join(os.path.abspath('.'), 'mkdocs.yml'),
+        )
+
+        test_config = {
+            'dir': 'Übersicht'.encode(encoding=sys.getfilesystemencoding())
+        }
+
+        cfg.load_dict(test_config)
+
+        fails, warns = cfg.validate()
+
+        # str does not include byte strings so validation fails
+        self.assertEqual(len(fails), 1)
+        self.assertEqual(len(warns), 0)
+
+    def test_dir_bad_encoding_fails(self):
+        cfg = Config(
+            [('dir', config_options.Dir())],
+            config_file_path=os.path.join(os.path.abspath('.'), 'mkdocs.yml'),
+        )
+
+        test_config = {
+            'dir': 'юникод'.encode(encoding='ISO 8859-5')
+        }
+
+        cfg.load_dict(test_config)
+
+        fails, warns = cfg.validate()
+
+        self.assertEqual(len(fails), 1)
+        self.assertEqual(len(warns), 0)
+
+    def test_config_dir_prepended(self):
+        base_path = os.path.abspath('.')
+        cfg = Config(
+            [('dir', config_options.Dir())],
+            config_file_path=os.path.join(base_path, 'mkdocs.yml'),
+        )
+
+        test_config = {
+            'dir': 'foo'
+        }
+
+        cfg.load_dict(test_config)
+
+        fails, warns = cfg.validate()
+
+        self.assertEqual(len(fails), 0)
+        self.assertEqual(len(warns), 0)
+        self.assertIsInstance(cfg['dir'], str)
+        self.assertEqual(cfg['dir'], os.path.join(base_path, 'foo'))
+
+    def test_dir_is_config_dir_fails(self):
+        cfg = Config(
+            [('dir', config_options.Dir())],
+            config_file_path=os.path.join(os.path.abspath('.'), 'mkdocs.yml'),
+        )
+
+        test_config = {
+            'dir': '.'
+        }
+
+        cfg.load_dict(test_config)
+
+        fails, warns = cfg.validate()
+
+        self.assertEqual(len(fails), 1)
+        self.assertEqual(len(warns), 0)
 
 
 class SiteDirTest(unittest.TestCase):
@@ -275,12 +513,23 @@ class SiteDirTest(unittest.TestCase):
         site_dir = config_options.SiteDir()
         docs_dir = config_options.Dir()
 
-        config['config_file_path'] = os.path.join(os.path.abspath('..'), 'mkdocs.yml')
+        fname = os.path.join(os.path.abspath('..'), 'mkdocs.yml')
 
         config['docs_dir'] = docs_dir.validate(config['docs_dir'])
         config['site_dir'] = site_dir.validate(config['site_dir'])
-        site_dir.post_validation(config, 'site_dir')
-        return True  # No errors were raised
+
+        schema = [
+            ('site_dir', site_dir),
+            ('docs_dir', docs_dir),
+        ]
+        cfg = Config(schema, fname)
+        cfg.load_dict(config)
+        failed, warned = cfg.validate()
+
+        if failed:
+            raise config_options.ValidationError(failed)
+
+        return True
 
     def test_doc_dir_in_site_dir(self):
 
@@ -331,74 +580,153 @@ class SiteDirTest(unittest.TestCase):
 
 class ThemeTest(unittest.TestCase):
 
-    def test_theme(self):
+    def test_theme_as_string(self):
 
         option = config_options.Theme()
         value = option.validate("mkdocs")
-        self.assertEqual("mkdocs", value)
+        self.assertEqual({'name': 'mkdocs'}, value)
 
-    def test_theme_invalid(self):
+    def test_uninstalled_theme_as_string(self):
 
         option = config_options.Theme()
         self.assertRaises(config_options.ValidationError,
                           option.validate, "mkdocs2")
 
-
-class ExtrasTest(unittest.TestCase):
-
-    def test_provided(self):
-
-        option = config_options.Extras(utils.is_markdown_file)
-        value = option.validate([])
-        self.assertEqual([], value)
-
-        option.post_validation({'extra_stuff': []}, 'extra_stuff')
-
-    def test_empty(self):
-
-        option = config_options.Extras(utils.is_template_file)
+    def test_theme_default(self):
+        option = config_options.Theme(default='mkdocs')
         value = option.validate(None)
-        self.assertEqual(None, value)
+        self.assertEqual({'name': 'mkdocs'}, value)
 
-    def test_invalid(self):
+    def test_theme_as_simple_config(self):
 
-        option = config_options.Extras(utils.is_html_file)
+        config = {
+            'name': 'mkdocs'
+        }
+        option = config_options.Theme()
+        value = option.validate(config)
+        self.assertEqual(config, value)
+
+    def test_theme_as_complex_config(self):
+
+        config = {
+            'name': 'mkdocs',
+            'custom_dir': 'custom',
+            'static_templates': ['sitemap.html'],
+            'show_sidebar': False
+        }
+        option = config_options.Theme()
+        value = option.validate(config)
+        self.assertEqual(config, value)
+
+    def test_theme_name_is_none(self):
+
+        config = {
+            'name': None
+        }
+        option = config_options.Theme()
+        value = option.validate(config)
+        self.assertEqual(config, value)
+
+    def test_theme_config_missing_name(self):
+
+        config = {
+            'custom_dir': 'custom',
+        }
+        option = config_options.Theme()
         self.assertRaises(config_options.ValidationError,
-                          option.validate, {})
+                          option.validate, config)
 
-    def test_walk(self):
+    def test_uninstalled_theme_as_config(self):
 
-        option = config_options.Extras(utils.is_markdown_file)
+        config = {
+            'name': 'mkdocs2'
+        }
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.validate, config)
 
-        tmp_dir = tempfile.mkdtemp()
+    def test_theme_invalid_type(self):
 
-        f1 = os.path.join(tmp_dir, 'file1.md')
-        f2 = os.path.join(tmp_dir, 'file2.md')
+        config = ['mkdocs2']
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.validate, config)
 
-        open(f1, 'a').close()
+    def test_post_validation_none_theme_name_and_missing_custom_dir(self):
 
-        # symlink isn't available on Python 2 on Windows.
-        if hasattr(os, 'symlink'):
-            os.symlink('/path/that/doesnt/exist', f2)
+        config = {
+            'theme': {
+                'name': None
+            }
+        }
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.post_validation, config, 'theme')
 
-        files = list(option.walk_docs_dir(tmp_dir))
+    @tempdir()
+    def test_post_validation_inexisting_custom_dir(self, abs_base_path):
 
-        self.assertEqual(['file1.md', ], files)
+        config = {
+            'theme': {
+                'name': None,
+                'custom_dir': abs_base_path + '/inexisting_custom_dir',
+            }
+        }
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.post_validation, config, 'theme')
+
+    def test_post_validation_locale_none(self):
+
+        config = {
+            'theme': {
+                'name': 'mkdocs',
+                'locale': None
+            }
+        }
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.post_validation, config, 'theme')
+
+    def test_post_validation_locale_invalid_type(self):
+
+        config = {
+            'theme': {
+                'name': 'mkdocs',
+                'locale': 0
+            }
+        }
+        option = config_options.Theme()
+        self.assertRaises(config_options.ValidationError,
+                          option.post_validation, config, 'theme')
+
+    def test_post_validation_locale(self):
+
+        config = {
+            'theme': {
+                'name': 'mkdocs',
+                'locale': 'fr'
+            }
+        }
+        option = config_options.Theme()
+        option.post_validation(config, 'theme')
+        self.assertEqual('fr', config['theme']['locale'].language)
 
 
-class PagesTest(unittest.TestCase):
+class NavTest(unittest.TestCase):
 
-    def test_provided(self):
+    def test_old_format(self):
 
-        option = config_options.Pages()
-        value = option.validate([['index.md', ], ])
-        self.assertEqual(['index.md', ], value)
-
-        option.post_validation({'extra_stuff': []}, 'extra_stuff')
+        option = config_options.Nav()
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate,
+            [['index.md', ], ]
+        )
 
     def test_provided_dict(self):
 
-        option = config_options.Pages()
+        option = config_options.Nav()
         value = option.validate([
             'index.md',
             {"Page": "page.md"}
@@ -409,7 +737,7 @@ class PagesTest(unittest.TestCase):
 
     def test_provided_empty(self):
 
-        option = config_options.Pages()
+        option = config_options.Nav()
         value = option.validate([])
         self.assertEqual(None, value)
 
@@ -417,70 +745,15 @@ class PagesTest(unittest.TestCase):
 
     def test_invalid_type(self):
 
-        option = config_options.Pages()
+        option = config_options.Nav()
         self.assertRaises(config_options.ValidationError,
                           option.validate, {})
 
     def test_invalid_config(self):
 
-        option = config_options.Pages()
+        option = config_options.Nav()
         self.assertRaises(config_options.ValidationError,
                           option.validate, [[], 1])
-
-
-class NumPagesTest(unittest.TestCase):
-
-    def test_one_page(self):
-
-        option = config_options.NumPages()
-        config = {
-            'key': None,
-            'pages': [1, ]
-        }
-        option.post_validation(config, 'key')
-        self.assertEqual({
-            'key': False,
-            'pages': [1, ]
-        }, config)
-
-    def test_many_pages(self):
-
-        option = config_options.NumPages()
-        config = {
-            'key': None,
-            'pages': [1, 2, 3]
-        }
-        option.post_validation(config, 'key')
-        self.assertEqual({
-            'key': True,
-            'pages': [1, 2, 3]
-        }, config)
-
-    def test_invalid_pages(self):
-
-        option = config_options.NumPages()
-        config = {
-            'key': None,
-            'pages': None
-        }
-        option.post_validation(config, 'key')
-        self.assertEqual({
-            'key': False,
-            'pages': None
-        }, config)
-
-    def test_provided(self):
-
-        option = config_options.NumPages()
-        config = {
-            'key': True,
-            'pages': None
-        }
-        option.post_validation(config, 'key')
-        self.assertEqual({
-            'key': True,
-            'pages': None
-        }, config)
 
 
 class PrivateTest(unittest.TestCase):
@@ -494,7 +767,8 @@ class PrivateTest(unittest.TestCase):
 
 class MarkdownExtensionsTest(unittest.TestCase):
 
-    def test_simple_list(self):
+    @patch('markdown.Markdown')
+    def test_simple_list(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': ['foo', 'bar']
@@ -506,7 +780,8 @@ class MarkdownExtensionsTest(unittest.TestCase):
             'mdx_configs': {}
         }, config)
 
-    def test_list_dicts(self):
+    @patch('markdown.Markdown')
+    def test_list_dicts(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': [
@@ -525,7 +800,8 @@ class MarkdownExtensionsTest(unittest.TestCase):
             }
         }, config)
 
-    def test_mixed_list(self):
+    @patch('markdown.Markdown')
+    def test_mixed_list(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': [
@@ -542,7 +818,28 @@ class MarkdownExtensionsTest(unittest.TestCase):
             }
         }, config)
 
-    def test_builtins(self):
+    @patch('markdown.Markdown')
+    def test_dict_of_dicts(self, mockMd):
+        option = config_options.MarkdownExtensions()
+        config = {
+            'markdown_extensions': {
+                'foo': {'foo_option': 'foo value'},
+                'bar': {'bar_option': 'bar value'},
+                'baz': {}
+            }
+        }
+        config['markdown_extensions'] = option.validate(config['markdown_extensions'])
+        option.post_validation(config, 'markdown_extensions')
+        self.assertEqual({
+            'markdown_extensions': ['foo', 'bar', 'baz'],
+            'mdx_configs': {
+                'foo': {'foo_option': 'foo value'},
+                'bar': {'bar_option': 'bar value'}
+            }
+        }, config)
+
+    @patch('markdown.Markdown')
+    def test_builtins(self, mockMd):
         option = config_options.MarkdownExtensions(builtins=['meta', 'toc'])
         config = {
             'markdown_extensions': ['foo', 'bar']
@@ -580,7 +877,8 @@ class MarkdownExtensionsTest(unittest.TestCase):
             'mdx_configs': {'toc': {'permalink': True}}
         }, config)
 
-    def test_configkey(self):
+    @patch('markdown.Markdown')
+    def test_configkey(self, mockMd):
         option = config_options.MarkdownExtensions(configkey='bar')
         config = {
             'markdown_extensions': [
@@ -608,12 +906,14 @@ class MarkdownExtensionsTest(unittest.TestCase):
             'mdx_configs': {}
         }, config)
 
-    def test_not_list(self):
+    @patch('markdown.Markdown')
+    def test_not_list(self, mockMd):
         option = config_options.MarkdownExtensions()
         self.assertRaises(config_options.ValidationError,
                           option.validate, 'not a list')
 
-    def test_invalid_config_option(self):
+    @patch('markdown.Markdown')
+    def test_invalid_config_option(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': [
@@ -625,7 +925,8 @@ class MarkdownExtensionsTest(unittest.TestCase):
             option.validate, config['markdown_extensions']
         )
 
-    def test_invalid_config_item(self):
+    @patch('markdown.Markdown')
+    def test_invalid_config_item(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': [
@@ -637,12 +938,23 @@ class MarkdownExtensionsTest(unittest.TestCase):
             option.validate, config['markdown_extensions']
         )
 
-    def test_invalid_dict_item(self):
+    @patch('markdown.Markdown')
+    def test_invalid_dict_item(self, mockMd):
         option = config_options.MarkdownExtensions()
         config = {
             'markdown_extensions': [
                 {'key1': 'value', 'key2': 'too many keys'}
             ]
+        }
+        self.assertRaises(
+            config_options.ValidationError,
+            option.validate, config['markdown_extensions']
+        )
+
+    def test_unknown_extension(self):
+        option = config_options.MarkdownExtensions()
+        config = {
+            'markdown_extensions': ['unknown']
         }
         self.assertRaises(
             config_options.ValidationError,

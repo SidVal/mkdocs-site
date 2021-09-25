@@ -1,47 +1,116 @@
 #!/usr/bin/env python
-# coding: utf-8
 
-from __future__ import unicode_literals
+import os
+import sys
 import logging
 import click
-import socket
+import textwrap
+import shutil
 
 from mkdocs import __version__
 from mkdocs import utils
-from mkdocs import exceptions
 from mkdocs import config
 from mkdocs.commands import build, gh_deploy, new, serve
 
 log = logging.getLogger(__name__)
 
-# Disable the warning that Click displays (as of Click version 5.0) when users
-# use unicode_literals in Python 2.
-# See http://click.pocoo.org/dev/python3/#unicode-literals for more details.
-click.disable_unicode_literals_warning = True
+
+class ColorFormatter(logging.Formatter):
+    colors = {
+        'CRITICAL': 'red',
+        'ERROR': 'red',
+        'WARNING': 'yellow',
+        'DEBUG': 'blue'
+    }
+
+    text_wrapper = textwrap.TextWrapper(
+        width=shutil.get_terminal_size(fallback=(0, 0)).columns,
+        replace_whitespace=False,
+        break_long_words=False,
+        break_on_hyphens=False,
+        initial_indent=' '*12,
+        subsequent_indent=' '*12
+    )
+
+    def format(self, record):
+        message = super().format(record)
+        prefix = f'{record.levelname:<8} -  '
+        if record.levelname in self.colors:
+            prefix = click.style(prefix, fg=self.colors[record.levelname])
+        if self.text_wrapper.width:
+            # Only wrap text if a terminal width was detected
+            msg = '\n'.join(
+                self.text_wrapper.fill(line)
+                for line in message.splitlines()
+            )
+            # Prepend prefix after wrapping so that color codes don't affect length
+            return prefix + msg[12:]
+        return prefix + message
 
 
-class State(object):
+class State:
     ''' Maintain logging level.'''
 
     def __init__(self, log_name='mkdocs', level=logging.INFO):
         self.logger = logging.getLogger(log_name)
+        # Don't restrict level on logger; use handler
+        self.logger.setLevel(1)
         self.logger.propagate = False
-        stream = logging.StreamHandler()
-        formatter = logging.Formatter("%(levelname)-7s -  %(message)s ")
-        stream.setFormatter(formatter)
-        self.logger.addHandler(stream)
 
-        self.logger.setLevel(level)
+        self.stream = logging.StreamHandler()
+        self.stream.setFormatter(ColorFormatter())
+        self.stream.setLevel(level)
+        self.stream.name = 'MkDocsStreamHandler'
+        self.logger.addHandler(self.stream)
+
+        # Add CountHandler for strict mode
+        self.counter = utils.log_counter
+        self.counter.setLevel(logging.WARNING)
+        self.logger.addHandler(self.counter)
 
 
 pass_state = click.make_pass_decorator(State, ensure=True)
+
+clean_help = "Remove old files from the site_dir before building (the default)."
+config_help = "Provide a specific MkDocs config"
+dev_addr_help = ("IP address and port to serve documentation locally (default: "
+                 "localhost:8000)")
+strict_help = ("Enable strict mode. This will cause MkDocs to abort the build "
+               "on any warnings.")
+theme_help = "The theme to use when building your documentation."
+theme_choices = utils.get_theme_names()
+site_dir_help = "The directory to output the result of the documentation build."
+use_directory_urls_help = "Use directory URLs when building pages (the default)."
+reload_help = "Enable the live reloading in the development server (this is the default)"
+no_reload_help = "Disable the live reloading in the development server."
+dirty_reload_help = "Enable the live reloading in the development server, but only re-build files that have changed"
+commit_message_help = ("A commit message to use when committing to the "
+                       "Github Pages remote branch. Commit {sha} and MkDocs {version} are available as expansions")
+remote_branch_help = ("The remote branch to commit to for Github Pages. This "
+                      "overrides the value specified in config")
+remote_name_help = ("The remote name to commit to for Github Pages. This "
+                    "overrides the value specified in config")
+force_help = "Force the push to the repository."
+ignore_version_help = "Ignore check that build is not being deployed with an older version of MkDocs."
+watch_theme_help = ("Include the theme in list of files to watch for live reloading. "
+                    "Ignored when live reload is not used.")
+shell_help = "Use the shell when invoking Git."
+
+
+def add_options(opts):
+    def inner(f):
+        for i in reversed(opts):
+            f = i(f)
+        return f
+
+    return inner
 
 
 def verbose_option(f):
     def callback(ctx, param, value):
         state = ctx.ensure_object(State)
         if value:
-            state.logger.setLevel(logging.DEBUG)
+            state.stream.setLevel(logging.DEBUG)
     return click.option('-v', '--verbose',
                         is_flag=True,
                         expose_value=False,
@@ -53,7 +122,7 @@ def quiet_option(f):
     def callback(ctx, param, value):
         state = ctx.ensure_object(State)
         if value:
-            state.logger.setLevel(logging.ERROR)
+            state.stream.setLevel(logging.ERROR)
     return click.option('-q', '--quiet',
                         is_flag=True,
                         expose_value=False,
@@ -61,36 +130,29 @@ def quiet_option(f):
                         callback=callback)(f)
 
 
-def common_options(f):
-    f = verbose_option(f)
-    f = quiet_option(f)
-    return f
+common_options = add_options([quiet_option, verbose_option])
+common_config_options = add_options([
+    click.option('-f', '--config-file', type=click.File('rb'), help=config_help),
+    # Don't override config value if user did not specify --strict flag
+    # Conveniently, load_config drops None values
+    click.option('-s', '--strict', is_flag=True, default=None, help=strict_help),
+    click.option('-t', '--theme', type=click.Choice(theme_choices), help=theme_help),
+    # As with --strict, set the default to None so that this doesn't incorrectly
+    # override the config file
+    click.option('--use-directory-urls/--no-directory-urls', is_flag=True, default=None, help=use_directory_urls_help)
+])
 
+PYTHON_VERSION = sys.version[:3]
 
-clean_help = "Remove old files from the site_dir before building (the default)."
-config_help = "Provide a specific MkDocs config"
-dev_addr_help = ("IP address and port to serve documentation locally (default: "
-                 "localhost:8000)")
-strict_help = ("Enable strict mode. This will cause MkDocs to abort the build "
-               "on any warnings.")
-theme_dir_help = "The theme directory to use when building your documentation."
-theme_help = "The theme to use when building your documentation."
-theme_choices = utils.get_theme_names()
-site_dir_help = "The directory to output the result of the documentation build."
-reload_help = "Enable the live reloading in the development server (this is the default)"
-no_reload_help = "Disable the live reloading in the development server."
-dirty_reload_help = "Enable the live reloading in the development server, but only re-build files that have changed"
-commit_message_help = ("A commit message to use when commiting to the "
-                       "Github Pages remote branch")
-remote_branch_help = ("The remote branch to commit to for Github Pages. This "
-                      "overrides the value specified in config")
-remote_name_help = ("The remote name to commit to for Github Pages. This "
-                    "overrides the value specified in config")
-force_help = "Force the push to the repository."
+PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 @click.group(context_settings={'help_option_names': ['-h', '--help']})
-@click.version_option(__version__, '-V', '--version')
+@click.version_option(
+    __version__,
+    '-V', '--version',
+    message=f'%(prog)s, version %(version)s from { PKG_DIR } (Python { PYTHON_VERSION })'
+)
 @common_options
 def cli():
     """
@@ -99,121 +161,48 @@ def cli():
 
 
 @cli.command(name="serve")
-@click.option('-f', '--config-file', type=click.File('rb'), help=config_help)
 @click.option('-a', '--dev-addr', help=dev_addr_help, metavar='<IP:PORT>')
-@click.option('-s', '--strict', is_flag=True, help=strict_help)
-@click.option('-t', '--theme', type=click.Choice(theme_choices), help=theme_help)
-@click.option('-e', '--theme-dir', type=click.Path(), help=theme_dir_help)
 @click.option('--livereload', 'livereload', flag_value='livereload', help=reload_help, default=True)
 @click.option('--no-livereload', 'livereload', flag_value='no-livereload', help=no_reload_help)
 @click.option('--dirtyreload', 'livereload', flag_value='dirty', help=dirty_reload_help)
+@click.option('--watch-theme', help=watch_theme_help, is_flag=True)
+@common_config_options
 @common_options
-def serve_command(dev_addr, config_file, strict, theme, theme_dir, livereload):
+def serve_command(dev_addr, livereload, **kwargs):
     """Run the builtin development server"""
-
-    logging.getLogger('tornado').setLevel(logging.WARNING)
-
-    # Don't override config value if user did not specify --strict flag
-    # Conveniently, load_config drops None values
-    strict = strict or None
-
-    try:
-        serve.serve(
-            config_file=config_file,
-            dev_addr=dev_addr,
-            strict=strict,
-            theme=theme,
-            theme_dir=theme_dir,
-            livereload=livereload
-        )
-    except (exceptions.ConfigurationError, socket.error) as e:  # pragma: no cover
-        # Avoid ugly, unhelpful traceback
-        raise SystemExit('\n' + str(e))
+    serve.serve(dev_addr=dev_addr, livereload=livereload, **kwargs)
 
 
 @cli.command(name="build")
 @click.option('-c', '--clean/--dirty', is_flag=True, default=True, help=clean_help)
-@click.option('-f', '--config-file', type=click.File('rb'), help=config_help)
-@click.option('-s', '--strict', is_flag=True, help=strict_help)
-@click.option('-t', '--theme', type=click.Choice(theme_choices), help=theme_help)
-@click.option('-e', '--theme-dir', type=click.Path(), help=theme_dir_help)
+@common_config_options
 @click.option('-d', '--site-dir', type=click.Path(), help=site_dir_help)
 @common_options
-def build_command(clean, config_file, strict, theme, theme_dir, site_dir):
+def build_command(clean, **kwargs):
     """Build the MkDocs documentation"""
-
-    # Don't override config value if user did not specify --strict flag
-    # Conveniently, load_config drops None values
-    strict = strict or None
-
-    try:
-        build.build(config.load_config(
-            config_file=config_file,
-            strict=strict,
-            theme=theme,
-            theme_dir=theme_dir,
-            site_dir=site_dir
-        ), dirty=not clean)
-    except exceptions.ConfigurationError as e:  # pragma: no cover
-        # Avoid ugly, unhelpful traceback
-        raise SystemExit('\n' + str(e))
-
-
-@cli.command(name="json")
-@click.option('-c', '--clean/--dirty', is_flag=True, default=True, help=clean_help)
-@click.option('-f', '--config-file', type=click.File('rb'), help=config_help)
-@click.option('-s', '--strict', is_flag=True, help=strict_help)
-@click.option('-d', '--site-dir', type=click.Path(), help=site_dir_help)
-@common_options
-def json_command(clean, config_file, strict, site_dir):
-    """Build the MkDocs documentation to JSON files
-
-    Rather than building your documentation to HTML pages, this
-    outputs each page in a simple JSON format. This command is
-    useful if you want to index your documentation in an external
-    search engine.
-    """
-
-    log.warning("The json command is deprecated and will be removed in a "
-                "future MkDocs release. For details on updating: "
-                "http://www.mkdocs.org/about/release-notes/")
-
-    # Don't override config value if user did not specify --strict flag
-    # Conveniently, load_config drops None values
-    strict = strict or None
-
-    try:
-        build.build(config.load_config(
-            config_file=config_file,
-            strict=strict,
-            site_dir=site_dir
-        ), dump_json=True, dirty=not clean)
-    except exceptions.ConfigurationError as e:  # pragma: no cover
-        # Avoid ugly, unhelpful traceback
-        raise SystemExit('\n' + str(e))
+    build.build(config.load_config(**kwargs), dirty=not clean)
 
 
 @cli.command(name="gh-deploy")
 @click.option('-c', '--clean/--dirty', is_flag=True, default=True, help=clean_help)
-@click.option('-f', '--config-file', type=click.File('rb'), help=config_help)
 @click.option('-m', '--message', help=commit_message_help)
 @click.option('-b', '--remote-branch', help=remote_branch_help)
 @click.option('-r', '--remote-name', help=remote_name_help)
 @click.option('--force', is_flag=True, help=force_help)
+@click.option('--ignore-version', is_flag=True, help=ignore_version_help)
+@click.option('--shell', is_flag=True, help=shell_help)
+@common_config_options
+@click.option('-d', '--site-dir', type=click.Path(), help=site_dir_help)
 @common_options
-def gh_deploy_command(config_file, clean, message, remote_branch, remote_name, force):
+def gh_deploy_command(clean, message, remote_branch, remote_name, force, ignore_version, shell, **kwargs):
     """Deploy your documentation to GitHub Pages"""
-    try:
-        cfg = config.load_config(
-            config_file=config_file,
-            remote_branch=remote_branch,
-            remote_name=remote_name
-        )
-        build.build(cfg, dirty=not clean)
-        gh_deploy.gh_deploy(cfg, message=message, force=force)
-    except exceptions.ConfigurationError as e:  # pragma: no cover
-        # Avoid ugly, unhelpful traceback
-        raise SystemExit('\n' + str(e))
+    cfg = config.load_config(
+        remote_branch=remote_branch,
+        remote_name=remote_name,
+        **kwargs
+    )
+    build.build(cfg, dirty=not clean)
+    gh_deploy.gh_deploy(cfg, message=message, force=force, ignore_version=ignore_version, shell=shell)
 
 
 @cli.command(name="new")

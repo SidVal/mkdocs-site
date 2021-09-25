@@ -1,21 +1,17 @@
 #!/usr/bin/env python
-# coding: utf-8
 
-from __future__ import unicode_literals
 import os
-import shutil
 import tempfile
 import unittest
+from tempfile import TemporaryDirectory
 
+import mkdocs
 from mkdocs import config
-from mkdocs import utils
 from mkdocs.config import config_options
+from mkdocs.config import defaults
 from mkdocs.exceptions import ConfigurationError
+from mkdocs.localization import parse_locale
 from mkdocs.tests.base import dedent
-
-
-def ensure_utf(string):
-    return string.encode('utf-8') if not utils.PY3 else string
 
 
 class ConfigTests(unittest.TestCase):
@@ -26,7 +22,7 @@ class ConfigTests(unittest.TestCase):
         self.assertRaises(ConfigurationError, load_missing_config)
 
     def test_missing_site_name(self):
-        c = config.Config(schema=config.DEFAULT_SCHEMA)
+        c = config.Config(schema=defaults.get_schema())
         c.load_dict({})
         errors, warnings = c.validate()
         self.assertEqual(len(errors), 1)
@@ -53,7 +49,7 @@ class ConfigTests(unittest.TestCase):
         """)
         config_file = tempfile.NamedTemporaryFile('w', delete=False)
         try:
-            config_file.write(ensure_utf(file_contents))
+            config_file.write(file_contents)
             config_file.flush()
             config_file.close()
 
@@ -78,111 +74,176 @@ class ConfigTests(unittest.TestCase):
         file_contents = dedent("""
         site_name: Example
         pages:
-        - ['index.md', 'Introduction']
+        - 'Introduction': 'index.md'
         """)
-        config_file = tempfile.NamedTemporaryFile('w', delete=False)
-        try:
-            config_file.write(ensure_utf(file_contents))
+        with TemporaryDirectory() as temp_path:
+            os.mkdir(os.path.join(temp_path, 'docs'))
+            config_path = os.path.join(temp_path, 'mkdocs.yml')
+            config_file = open(config_path, 'w')
+
+            config_file.write(file_contents)
             config_file.flush()
             config_file.close()
 
             result = config.load_config(config_file=config_file.name)
             self.assertEqual(result['site_name'], expected_result['site_name'])
             self.assertEqual(result['pages'], expected_result['pages'])
-        finally:
-            os.remove(config_file.name)
 
     def test_theme(self):
+        with TemporaryDirectory() as mytheme, TemporaryDirectory() as custom:
+            configs = [
+                dict(),  # default theme
+                {"theme": "readthedocs"},  # builtin theme
+                {"theme": {'name': 'readthedocs'}},  # builtin as complex
+                {"theme": {'name': None, 'custom_dir': mytheme}},  # custom only as complex
+                {"theme": {'name': 'readthedocs', 'custom_dir': custom}},  # builtin and custom as complex
+                {  # user defined variables
+                    'theme': {
+                        'name': 'mkdocs',
+                        'locale': 'fr',
+                        'static_templates': ['foo.html'],
+                        'show_sidebar': False,
+                        'some_var': 'bar'
+                    }
+                }
+            ]
 
-        mytheme = tempfile.mkdtemp()
-        custom = tempfile.mkdtemp()
+            mkdocs_dir = os.path.abspath(os.path.dirname(mkdocs.__file__))
+            mkdocs_templates_dir = os.path.join(mkdocs_dir, 'templates')
+            theme_dir = os.path.abspath(os.path.join(mkdocs_dir, 'themes'))
 
-        configs = [
-            dict(),  # default theme
-            {"theme": "readthedocs"},  # builtin theme
-            {"theme_dir": mytheme},  # custom only
-            {"theme": "readthedocs", "theme_dir": custom},  # builtin and custom
-        ]
+            results = (
+                {
+                    'dirs': [os.path.join(theme_dir, 'mkdocs'), mkdocs_templates_dir],
+                    'static_templates': ['404.html', 'sitemap.xml'],
+                    'vars': {
+                        'locale': parse_locale('en'),
+                        'include_search_page': False,
+                        'search_index_only': False,
+                        'analytics': {'gtag': None},
+                        'highlightjs': True,
+                        'hljs_style': 'github',
+                        'hljs_languages': [],
+                        'navigation_depth': 2,
+                        'nav_style': 'primary',
+                        'shortcuts': {'help': 191, 'next': 78, 'previous': 80, 'search': 83}
+                    }
+                }, {
+                    'dirs': [os.path.join(theme_dir, 'readthedocs'), mkdocs_templates_dir],
+                    'static_templates': ['404.html', 'sitemap.xml'],
+                    'vars': {
+                        'locale': parse_locale('en'),
+                        'include_search_page': True,
+                        'search_index_only': False,
+                        'analytics': {'gtag': None},
+                        'highlightjs': True,
+                        'hljs_languages': [],
+                        'include_homepage_in_sidebar': True,
+                        'prev_next_buttons_location': 'bottom',
+                        'navigation_depth': 4,
+                        'sticky_navigation': True,
+                        'titles_only': False,
+                        'collapse_navigation': True
+                    }
+                }, {
+                    'dirs': [os.path.join(theme_dir, 'readthedocs'), mkdocs_templates_dir],
+                    'static_templates': ['404.html', 'sitemap.xml'],
+                    'vars': {
+                        'locale': parse_locale('en'),
+                        'include_search_page': True,
+                        'search_index_only': False,
+                        'analytics': {'gtag': None},
+                        'highlightjs': True,
+                        'hljs_languages': [],
+                        'include_homepage_in_sidebar': True,
+                        'prev_next_buttons_location': 'bottom',
+                        'navigation_depth': 4,
+                        'sticky_navigation': True,
+                        'titles_only': False,
+                        'collapse_navigation': True
+                    }
+                }, {
+                    'dirs': [mytheme, mkdocs_templates_dir],
+                    'static_templates': ['sitemap.xml'],
+                    'vars': {'locale': parse_locale('en')}
+                }, {
+                    'dirs': [custom, os.path.join(theme_dir, 'readthedocs'), mkdocs_templates_dir],
+                    'static_templates': ['404.html', 'sitemap.xml'],
+                    'vars': {
+                        'locale': parse_locale('en'),
+                        'include_search_page': True,
+                        'search_index_only': False,
+                        'analytics': {'gtag': None},
+                        'highlightjs': True,
+                        'hljs_languages': [],
+                        'include_homepage_in_sidebar': True,
+                        'prev_next_buttons_location': 'bottom',
+                        'navigation_depth': 4,
+                        'sticky_navigation': True,
+                        'titles_only': False,
+                        'collapse_navigation': True
+                    }
+                }, {
+                    'dirs': [os.path.join(theme_dir, 'mkdocs'), mkdocs_templates_dir],
+                    'static_templates': ['404.html', 'sitemap.xml', 'foo.html'],
+                    'vars': {
+                        'locale': parse_locale('fr'),
+                        'show_sidebar': False,
+                        'some_var': 'bar',
+                        'include_search_page': False,
+                        'search_index_only': False,
+                        'analytics': {'gtag': None},
+                        'highlightjs': True,
+                        'hljs_style': 'github',
+                        'hljs_languages': [],
+                        'navigation_depth': 2,
+                        'nav_style': 'primary',
+                        'shortcuts': {'help': 191, 'next': 78, 'previous': 80, 'search': 83}
+                    }
+                }
+            )
 
-        abs_path = os.path.abspath(os.path.dirname(__file__))
-        mkdocs_dir = os.path.abspath(os.path.join(abs_path, '..', '..'))
-        theme_dir = os.path.abspath(os.path.join(mkdocs_dir, 'themes'))
-        search_asset_dir = os.path.abspath(os.path.join(
-            mkdocs_dir, 'assets', 'search'))
+            for config_contents, result in zip(configs, results):
 
-        results = (
-            [os.path.join(theme_dir, 'mkdocs'), search_asset_dir],
-            [os.path.join(theme_dir, 'readthedocs'), search_asset_dir],
-            [mytheme, search_asset_dir],
-            [custom, os.path.join(theme_dir, 'readthedocs'), search_asset_dir],
-        )
+                c = config.Config(schema=(('theme', config_options.Theme(default='mkdocs')),))
+                c.load_dict(config_contents)
+                errors, warnings = c.validate()
+                self.assertEqual(len(errors), 0)
+                self.assertEqual(c['theme'].dirs, result['dirs'])
+                self.assertEqual(c['theme'].static_templates, set(result['static_templates']))
+                self.assertEqual({k: c['theme'][k] for k in iter(c['theme'])}, result['vars'])
 
-        for config_contents, result in zip(configs, results):
+    def test_empty_nav(self):
+        conf = config.Config(schema=defaults.get_schema())
+        conf.load_dict({
+            'site_name': 'Example',
+            'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml')
+        })
+        conf.validate()
+        self.assertEqual(conf['nav'], None)
 
-            c = config.Config(schema=(
-                ('theme', config_options.Theme(default='mkdocs')),
-                ('theme_dir', config_options.ThemeDir(exists=True)),
-            ))
-            c.load_dict(config_contents)
-            c.validate()
-            self.assertEqual(c['theme_dir'], result)
+    def test_copy_pages_to_nav(self):
+        # TODO: remove this when pages config setting is fully deprecated.
+        conf = config.Config(schema=defaults.get_schema())
+        conf.load_dict({
+            'site_name': 'Example',
+            'pages': ['index.md', 'about.md'],
+            'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml')
+        })
+        conf.validate()
+        self.assertEqual(conf['nav'], ['index.md', 'about.md'])
 
-    def test_default_pages(self):
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            open(os.path.join(tmp_dir, 'index.md'), 'w').close()
-            open(os.path.join(tmp_dir, 'about.md'), 'w').close()
-            conf = config.Config(schema=config.DEFAULT_SCHEMA)
-            conf.load_dict({
-                'site_name': 'Example',
-                'docs_dir': tmp_dir,
-                'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml')
-            })
-            conf.validate()
-            self.assertEqual(['index.md', 'about.md'], conf['pages'])
-        finally:
-            shutil.rmtree(tmp_dir)
-
-    def test_default_pages_nested(self):
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            open(os.path.join(tmp_dir, 'index.md'), 'w').close()
-            open(os.path.join(tmp_dir, 'getting-started.md'), 'w').close()
-            open(os.path.join(tmp_dir, 'about.md'), 'w').close()
-            os.makedirs(os.path.join(tmp_dir, 'subA'))
-            open(os.path.join(tmp_dir, 'subA', 'index.md'), 'w').close()
-            os.makedirs(os.path.join(tmp_dir, 'subA', 'subA1'))
-            open(os.path.join(tmp_dir, 'subA', 'subA1', 'index.md'), 'w').close()
-            os.makedirs(os.path.join(tmp_dir, 'subC'))
-            open(os.path.join(tmp_dir, 'subC', 'index.md'), 'w').close()
-            os.makedirs(os.path.join(tmp_dir, 'subB'))
-            open(os.path.join(tmp_dir, 'subB', 'index.md'), 'w').close()
-            conf = config.Config(schema=config.DEFAULT_SCHEMA)
-            conf.load_dict({
-                'site_name': 'Example',
-                'docs_dir': tmp_dir,
-                'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml')
-            })
-            conf.validate()
-            self.assertEqual([
-                'index.md',
-                'about.md',
-                'getting-started.md',
-                {'subA': [
-                    os.path.join('subA', 'index.md'),
-                    {'subA1': [
-                        os.path.join('subA', 'subA1', 'index.md')
-                    ]}
-                ]},
-                {'subB': [
-                    os.path.join('subB', 'index.md')
-                ]},
-                {'subC': [
-                    os.path.join('subC', 'index.md')
-                ]}
-            ], conf['pages'])
-        finally:
-            shutil.rmtree(tmp_dir)
+    def test_dont_overwrite_nav_with_pages(self):
+        # TODO: remove this when pages config setting is fully deprecated.
+        conf = config.Config(schema=defaults.get_schema())
+        conf.load_dict({
+            'site_name': 'Example',
+            'pages': ['index.md', 'about.md'],
+            'nav': ['foo.md', 'bar.md'],
+            'config_file_path': os.path.join(os.path.abspath('.'), 'mkdocs.yml')
+        })
+        conf.validate()
+        self.assertEqual(conf['nav'], ['foo.md', 'bar.md'])
 
     def test_doc_dir_in_site_dir(self):
 
@@ -194,7 +255,7 @@ class ConfigTests(unittest.TestCase):
             {'docs_dir': '.', 'site_dir': '.'},
             {'docs_dir': 'docs', 'site_dir': ''},
             {'docs_dir': '', 'site_dir': ''},
-            {'docs_dir': j('..', 'mkdocs', 'docs'), 'site_dir': 'docs'},
+            {'docs_dir': 'docs', 'site_dir': 'docs'},
         )
 
         conf = {
@@ -210,7 +271,7 @@ class ConfigTests(unittest.TestCase):
             c = config.Config(schema=(
                 ('docs_dir', config_options.Dir(default='docs')),
                 ('site_dir', config_options.SiteDir(default='site')),
-                ('config_file_path', config_options.Type(utils.string_types))
+                ('config_file_path', config_options.Type(str))
             ))
             c.load_dict(patch)
 
@@ -218,3 +279,19 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(len(errors), 1)
             self.assertEqual(warnings, [])
+
+    def testConfigInstancesUnique(self):
+        conf = mkdocs.config.Config(mkdocs.config.defaults.get_schema())
+        conf.load_dict({'site_name': 'foo'})
+        conf.validate()
+        self.assertIsNone(conf['mdx_configs'].get('toc'))
+
+        conf = mkdocs.config.Config(mkdocs.config.defaults.get_schema())
+        conf.load_dict({'site_name': 'foo', 'markdown_extensions': [{"toc": {"permalink": "aaa"}}]})
+        conf.validate()
+        self.assertEqual(conf['mdx_configs'].get('toc'), {'permalink': 'aaa'})
+
+        conf = mkdocs.config.Config(mkdocs.config.defaults.get_schema())
+        conf.load_dict({'site_name': 'foo'})
+        conf.validate()
+        self.assertIsNone(conf['mdx_configs'].get('toc'))
